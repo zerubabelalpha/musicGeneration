@@ -569,14 +569,194 @@ class DenseReferenceBackend:
         return normalized
 
 
+@dataclass(frozen=True)
 class JaxSBBackend:
-    """Optional JAX backend placeholder. Not implemented in this ticket."""
+    """JAX implementation for accelerated numerical operations while maintaining
+    exact parity with the NumPy backend.
+    
+    All operations follow the merge-first underflow policy: duplicate edges to the
+    same (scatter_to, gather_from) pair are combined with log-sum-exp before
+    checking the underflow floor.
+    """
+
+    _jnp: Any = None
 
     def __init__(self) -> None:
-        raise SBBackendError(
-            "SBBackend.JAX is not implemented. Implement padded scatter "
-            "log-sum-exp per docs/sb-backend.md before enabling JAX parity."
+        """Initialize JAX backend, importing JAX lazily."""
+        try:
+            import jax
+            import jax.numpy as jnp
+        except ImportError as exc:
+            raise SBBackendError("JAX backend requires JAX to be installed.") from exc
+
+        if not bool(jax.config.x64_enabled):
+            raise SBBackendError("JAX backend requires 64-bit precision.")
+        
+        object.__setattr__(self, "_jnp", jnp)
+
+    def logsumexp(
+        self,
+        values: np.ndarray,
+        *,
+        mask: Optional[np.ndarray] = None,
+        underflow_floor: Optional[float] = None,
+        context: str = "logsumexp",
+    ) -> float:
+        """Return ``log(sum(exp(values)))`` over finite, unmasked entries using JAX."""
+        log_values = _as_log_array("values", values)
+        log_mask = _as_mask("mask", mask, length=log_values.size)
+        
+        jnp = self._jnp
+        
+        # Convert to JAX arrays
+        jax_values = jnp.array(log_values)
+        
+        # Build finite AND user mask
+        finite_mask = jnp.isfinite(jax_values)
+        if log_mask is not None:
+            jax_mask = jnp.array(log_mask)
+            finite_mask = finite_mask & jax_mask
+        
+        # Check for empty support
+        if not jnp.any(finite_mask):
+            return float("-inf")
+        
+        # Extract finite, unmasked values
+        finite_values = jax_values[finite_mask]
+        max_value = float(jnp.max(finite_values))
+        shifts = finite_values - max_value
+        
+        # Check underflow floor
+        if underflow_floor is not None:
+            min_shift = float(jnp.min(shifts))
+            if min_shift < underflow_floor:
+                raise SBSolverError(
+                    f"{context} encountered shift below underflow floor: "
+                    f"min_shift={min_shift:.6g}, floor={underflow_floor:.6g}."
+                )
+        
+        # Compute log-sum-exp
+        result = float(max_value + jnp.log(jnp.sum(jnp.exp(shifts))))
+        return result
+
+    def scatter_logsumexp(
+        self,
+        log_weights: np.ndarray,
+        gather_from: np.ndarray,
+        messages: np.ndarray,
+        scatter_to: np.ndarray,
+        out_size: int,
+        *,
+        edge_mask: Optional[np.ndarray] = None,
+        underflow_floor: Optional[float] = None,
+        context: str = "scatter_logsumexp",
+    ) -> np.ndarray:
+        """Grouped log-sum-exp after gathering messages onto sparse edges.
+        
+        Implements the merge-first policy: duplicate (scatter_to, gather_from) pairs
+        are combined with log-sum-exp before checking the underflow floor.
+        """
+        weights, msgs, gather, scatter, mask = _prepare_scatter_args(
+            log_weights, gather_from, messages, scatter_to, out_size, edge_mask
         )
+        
+        jnp = self._jnp
+        
+        # Phase 1: merge duplicate (scatter_to, gather_from) cells with logaddexp
+        # Build a dictionary-like structure using NumPy for flexibility
+        merged: dict[tuple[int, int], float] = {}
+        for idx in range(weights.size):
+            if mask is not None and not bool(mask[idx]):
+                continue
+            key = (int(scatter[idx]), int(gather[idx]))
+            w = float(weights[idx])
+            if key in merged:
+                merged[key] = float(np.logaddexp(merged[key], w))
+            else:
+                merged[key] = w
+        
+        # Phase 2: add gathered messages and group by scatter_to
+        grouped: list[list[float]] = [[] for _ in range(out_size)]
+        for (scatter_idx, gather_idx), w in merged.items():
+            grouped[scatter_idx].append(w + float(msgs[gather_idx]))
+        
+        # Phase 3: per-group log-sum-exp with underflow floor on merged cells
+        result = np.full(out_size, float("-inf"), dtype=_LOG_DTYPE)
+        for group_idx, group in enumerate(grouped):
+            if group:
+                jax_group = jnp.array(group, dtype=jnp.float64)
+                finite_mask = jnp.isfinite(jax_group)
+                
+                if not jnp.any(finite_mask):
+                    result[group_idx] = float("-inf")
+                    continue
+                
+                finite_values = jax_group[finite_mask]
+                max_value = float(jnp.max(finite_values))
+                shifts = finite_values - max_value
+                
+                # Check underflow floor
+                if underflow_floor is not None:
+                    min_shift = float(jnp.min(shifts))
+                    if min_shift < underflow_floor:
+                        raise SBSolverError(
+                            f"{context}[group={group_idx}] encountered shift below "
+                            f"underflow floor: min_shift={min_shift:.6g}, "
+                            f"floor={underflow_floor:.6g}."
+                        )
+                
+                result[group_idx] = float(max_value + jnp.log(jnp.sum(jnp.exp(shifts))))
+        
+        return result
+
+    def normalize_log_probs(
+        self,
+        log_values: np.ndarray,
+        *,
+        mask: Optional[np.ndarray] = None,
+        underflow_floor: Optional[float] = None,
+        context: str = "normalize_log_probs",
+    ) -> np.ndarray:
+        """Subtract log-sum-exp so unmasked finite mass forms a log-distribution."""
+        values = _as_log_array("log_values", log_values)
+        log_mask = _as_mask("mask", mask, length=values.size)
+        
+        jnp = self._jnp
+        
+        # Apply mask by setting masked entries to -inf
+        working = _apply_mask_as_neg_inf(values, log_mask)
+        jax_working = jnp.array(working)
+        
+        # Find finite values
+        finite_mask = jnp.isfinite(jax_working)
+        if not jnp.any(finite_mask):
+            raise SBSolverError(f"{context} has empty finite support.")
+        
+        # Compute normalizer
+        finite_vals = jax_working[finite_mask]
+        max_value = float(jnp.max(finite_vals))
+        shifts = finite_vals - max_value
+        
+        # Check underflow floor
+        if underflow_floor is not None:
+            min_shift = float(jnp.min(shifts))
+            if min_shift < underflow_floor:
+                raise SBSolverError(
+                    f"{context} encountered shift below underflow floor: "
+                    f"min_shift={min_shift:.6g}, floor={underflow_floor:.6g}."
+                )
+        
+        normalizer = float(max_value + jnp.log(jnp.sum(jnp.exp(shifts))))
+        
+        # Normalize
+        normalized = np.array(jax_working - normalizer, dtype=_LOG_DTYPE)
+        
+        # Restore -inf at masked positions
+        if log_mask is not None:
+            normalized = normalized.copy()
+            normalized[~log_mask] = float("-inf")
+        
+        return normalized
 
 
 def backend_array_contract() -> Mapping[str, str]:
@@ -592,4 +772,6 @@ def backend_array_contract() -> Mapping[str, str]:
         "empty_reduction": "-inf",
         "padding": "trailing edges with edge_mask=False; padded log_weights should be -inf",
         "node_padding": "pad states to k_max with node mask; padded logs are -inf",
+        "jax_precision": "must have 64-bit mode enabled; backend operations must preserve float64 "
+
     }
