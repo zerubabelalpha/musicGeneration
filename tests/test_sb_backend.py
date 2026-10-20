@@ -20,6 +20,7 @@ from aimusic.planning.sb import (
 )
 from aimusic.planning.sb_backend import (
     DenseReferenceBackend,
+    JaxSBBackend,
     NumpySBBackend,
     SBNumericBackend as BackendProtocol,
     backend_array_contract,
@@ -28,7 +29,16 @@ from aimusic.planning.sb_backend import (
 )
 
 _ATOL = 1e-8
-_BACKENDS = (NumpySBBackend, DenseReferenceBackend)
+
+# detect if JAX
+try:
+    import jax
+    jax.config.update("jax_enable_x64", True)
+    _JAX_AVAILABLE = True
+    _BACKENDS = (NumpySBBackend, DenseReferenceBackend, JaxSBBackend,)
+except ImportError:
+    _JAX_AVAILABLE = False
+    _BACKENDS = (NumpySBBackend, DenseReferenceBackend)
 
 # Fixtures
 
@@ -277,8 +287,14 @@ class TestBackendContract(unittest.TestCase):
         self.assertAlmostEqual(padded[0], math.log(0.5 * 0.2 + 0.25 * 0.8), places=12)
 
     def test_select_jax_and_broken_invoke(self):
-        with self.assertRaises(SBBackendError):
-            select_sb_backend(SBBackend.JAX)
+        if not _JAX_AVAILABLE:
+            with self.assertRaises(SBBackendError):
+                select_sb_backend(SBBackend.JAX)
+        else:
+            # JAX is available, should succeed
+            backend = select_sb_backend(SBBackend.JAX)
+            self.assertIsInstance(backend, JaxSBBackend)
+        
         with self.assertRaises(SBBackendError):
             invoke_backend(_BrokenBackend(), "scatter_logsumexp",
                            log_weights=np.zeros(1))
@@ -360,6 +376,66 @@ class TestNumpyDenseParity(unittest.TestCase):
         self.assertEqual(n.trace.converged, d.trace.converged)
         self.assertEqual(n.trace.iterations, 1)
 
+    def test_feasible_random_graphs_full_parity(self):
+        rng = np.random.default_rng(73)
+        compared = 0
+
+        for _ in range(15):
+            problem = _try_random(rng, feasible=True)
+            if problem is None:
+                continue
+
+            n = solve_sb(problem, backend=NumpySBBackend())
+            d = solve_sb(problem, backend=DenseReferenceBackend())
+
+            # Both implementations must converge on feasible problems.
+            self.assertTrue(n.trace.converged)
+            self.assertTrue(d.trace.converged)
+
+            # Compare forward/backward potentials and marginals.
+            for name, left_layers, right_layers in (
+                (
+                    "forward potentials",
+                    n.log_forward_potentials,
+                    d.log_forward_potentials,
+                ),
+                (
+                    "backward potentials",
+                    n.log_backward_potentials,
+                    d.log_backward_potentials,
+                ),
+                (
+                    "node marginals",
+                    n.marginals.node_marginals_by_layer,
+                    d.marginals.node_marginals_by_layer,
+                ),
+                (
+                    "edge marginals",
+                    n.marginals.edge_marginals_by_time,
+                    d.marginals.edge_marginals_by_time,
+                ),
+            ):
+                self.assertEqual(len(left_layers), len(right_layers), name)
+
+                for layer_index, (left, right) in enumerate(zip(left_layers, right_layers)):
+                    np.testing.assert_allclose(left, right, atol=1e-7, rtol=1e-7,
+                    err_msg=f"{name} differ at layer {layer_index}",)
+
+            # Conditional probabilities must also agree.
+            n_bridge = n.to_bridge(backend=NumpySBBackend())
+            d_bridge = d.to_bridge(backend=DenseReferenceBackend())
+
+            self.assertEqual(len(n_bridge.edge_probabilities_by_time), len(d_bridge.edge_probabilities_by_time),)
+
+            for t, (left, right) in enumerate(
+                zip(n_bridge.edge_probabilities_by_time, d_bridge.edge_probabilities_by_time,)):
+                np.testing.assert_allclose(left, right, atol=1e-7, rtol=1e-7,
+                    err_msg=f"Conditional probabilities differ at time {t}",)
+
+            compared += 1
+
+        self.assertGreaterEqual(compared, 8,
+            "Fewer than 8 feasible random problems were compared",)
 
 # Feasible convergence + endpoint / flow invariants
 
@@ -368,37 +444,59 @@ class TestFeasibleConvergenceAndFlow(unittest.TestCase):
     def test_feasible_problems_converge_and_conserve_flow(self):
         rng = np.random.default_rng(42)
         checked = 0
-        for _ in range(15):
+
+        for case_index in range(15):
             problem = _try_random(rng, feasible=True)
             if problem is None:
                 continue
-            solution = solve_sb(problem)
-            self.assertTrue(
-                solution.trace.converged,
-                msg=(f"iters={solution.trace.iterations} "
-                     f"delta={solution.trace.final_max_delta:g}"),
-            )
+
             graph = problem.graph
-            idx = [{s: i for i, s in enumerate(l.states)} for l in graph.layers]
-            m = solution.marginals
+            idx = [{s: i for i, s in enumerate(layer.states)}
+                for layer in graph.layers]
 
-            # Endpoints equal pi0 / piT.
-            self.assertTrue(np.allclose(m.node_marginals_by_layer[0],
-                                        problem.pi0.probabilities, atol=1e-7))
-            self.assertTrue(np.allclose(m.node_marginals_by_layer[-1],
-                                        problem.piT.probabilities, atol=1e-7))
+            # Test every available backend on the same feasible problem.
+            for Backend in _BACKENDS:
+                with self.subTest(
+                    case=case_index,
+                    backend=Backend.__name__,
+                ):
+                    solution = solve_sb(problem, backend=Backend())
 
-            # Source/target flow equals node marginals at each cut.
-            for t, edges in enumerate(graph.edges_by_time):
-                src = np.zeros(len(graph.layers[t].states))
-                dst = np.zeros(len(graph.layers[t + 1].states))
-                for e, mass in zip(edges, m.edge_marginals_by_time[t]):
-                    src[idx[t][e.source]] += mass
-                    dst[idx[t + 1][e.target]] += mass
-                self.assertTrue(np.allclose(src, m.node_marginals_by_layer[t], atol=1e-7))
-                self.assertTrue(np.allclose(dst, m.node_marginals_by_layer[t + 1], atol=1e-7))
+                    # Feasible problems should converge.
+                    self.assertTrue(
+                        solution.trace.converged,
+                        msg=(
+                            f"{Backend.__name__} did not converge: "
+                            f"iters={solution.trace.iterations}, "
+                            f"delta={solution.trace.final_max_delta:g}"
+                        ),
+                    )
+
+                    m = solution.marginals
+
+                    # Initial and terminal marginals must match the
+                    # requested endpoint distributions.
+                    self.assertTrue(np.allclose(m.node_marginals_by_layer[0],
+                            problem.pi0.probabilities, atol=1e-7,),
+                        msg="Initial marginal does not match pi0",)
+                    self.assertTrue(np.allclose(m.node_marginals_by_layer[-1],
+                            problem.piT.probabilities, atol=1e-7,),
+                        msg="Terminal marginal does not match piT",)
+
+                    # Source/target flow equals node marginals at each cut.
+                    for t, edges in enumerate(graph.edges_by_time):
+                        src = np.zeros(len(graph.layers[t].states))
+                        dst = np.zeros(len(graph.layers[t + 1].states))
+                        for e, mass in zip(edges, m.edge_marginals_by_time[t]):
+                            src[idx[t][e.source]] += mass
+                            dst[idx[t + 1][e.target]] += mass
+                        self.assertTrue( np.allclose( src, m.node_marginals_by_layer[t], atol=1e-7,),
+                            msg=f"Source flow mismatch at layer {t}",)
+                        self.assertTrue(np.allclose(dst, m.node_marginals_by_layer[t + 1], atol=1e-7, ),
+                            msg=f"Target flow mismatch at layer {t}",)
+
             checked += 1
-        self.assertGreaterEqual(checked, 8)
+        self.assertGreaterEqual(checked, 8, "Fewer than 8 feasible random problems were tested",)
 
 
 # Independent oracles
@@ -430,6 +528,38 @@ class TestIndependentOracles(unittest.TestCase):
                     msg=f"{B.__name__} disagrees with math oracle",
                 )
 
+    def test_conditionals_match_known_uniform_kernel_solution(self):
+        edges = tuple(
+            Edge(time_index=0, source=_state(0, src), target=_state(1, dst), log_weight=0.0,)
+            for src in range(2)
+            for dst in range(2)
+        )
+        graph = _graph((2, 2), (edges,))
+
+        pi0 = EndpointDistribution(layer=graph.layers[0], probabilities=(0.5, 0.5))
+        piT = EndpointDistribution(layer=graph.layers[1], probabilities=(0.4, 0.6))
+
+        problem = build_sb_problem(
+            graph, pi0, piT,
+            sb_config=SBConfig(horizon_t=1, max_iterations=500, tolerance=1e-10,),)
+
+        expected_cond = np.array([0.4, 0.6, 0.4, 0.6])
+        expected_edge_mass = np.array([0.2, 0.3, 0.2, 0.3])
+
+        for Backend in _BACKENDS:
+            with self.subTest(backend=Backend.__name__):
+                backend = Backend()
+                solution = solve_sb(problem, backend=backend)
+                self.assertTrue(solution.trace.converged)
+
+                bridge = solution.to_bridge(backend=Backend())
+
+                np.testing.assert_allclose(
+                    bridge.edge_probabilities_by_time[0],
+                    expected_cond, atol=1e-8, rtol=1e-8,)
+                np.testing.assert_allclose(
+                    solution.marginals.edge_marginals_by_time[0],
+                    expected_edge_mass, atol=1e-8, rtol=1e-8,)
 
 # Injection and malformed returns
 
@@ -481,6 +611,25 @@ class TestInjectionAndMalformed(unittest.TestCase):
                 with self.assertRaises(exc):
                     invoke_backend(backend, op, **kwargs)
 
+class TestInfeasibleProblems(unittest.TestCase):
+    def test_disconnected_component_mass_mismatch_does_not_converge(self):
+        edges = (
+            Edge(time_index=0, source=_state(0, 0), target=_state(1, 0), log_weight=0.0,),
+            Edge(time_index=0, source=_state(0, 1), target=_state(1, 1), log_weight=0.0,),
+        )
+        graph = _graph((2, 2), (edges,))
+
+        pi0 = EndpointDistribution(layer=graph.layers[0], probabilities=(0.5, 0.5))
+        piT = EndpointDistribution(layer=graph.layers[1], probabilities=(0.75, 0.25))
+
+        problem = build_sb_problem(graph, pi0, piT,
+            sb_config=SBConfig(horizon_t=1, max_iterations=25,
+            tolerance=1e-10,raise_on_non_convergence=False,),)
+
+        for Backend in _BACKENDS:
+            with self.subTest(backend=Backend.__name__):
+                solution = solve_sb(problem, backend=Backend())
+                self.assertFalse(solution.trace.converged)
 
 if __name__ == "__main__":
     unittest.main()
