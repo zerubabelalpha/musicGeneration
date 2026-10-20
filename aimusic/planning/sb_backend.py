@@ -586,6 +586,7 @@ class JaxSBBackend:
         try:
             import jax
             import jax.numpy as jnp
+            jax.config.update("jax_enable_x64", True) # to enable jax 64 bit mode
         except ImportError as exc:
             raise SBBackendError("JAX backend requires JAX to be installed.") from exc
 
