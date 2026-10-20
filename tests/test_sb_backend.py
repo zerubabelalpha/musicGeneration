@@ -329,16 +329,44 @@ class TestNumpyDenseParity(unittest.TestCase):
             messages=np.array([math.log(0.3), math.log(0.7)]),
             out_size=2, edge_mask=np.array([True, True, True, False]),
         )
-        r0, r1 = (B().scatter_logsumexp(**kw) for B in _BACKENDS)
-        self.assertTrue(np.allclose(r0, r1, atol=_ATOL))
-        self.assertTrue(np.allclose(
-            r0, [math.log(0.4 * 0.3 + 0.1 * 0.7), math.log(0.4 * 0.3)], atol=_ATOL))
 
+        # Compare across available backend.
+        scatter_results = [
+            (B.__name__, B().scatter_logsumexp(**kw))
+            for B in _BACKENDS
+        ]
+
+        reference_name, reference = scatter_results[0]
+
+        for backend_name, result in scatter_results[1:]:
+            np.testing.assert_allclose( result, reference, atol=_ATOL, rtol=_ATOL,
+                err_msg=(
+                    f"scatter_logsumexp differs between "
+                    f"{reference_name} and {backend_name}"),)
+
+        # Check the answer independently.
+        expected = np.array([math.log(0.4 * 0.3 + 0.1 * 0.7), math.log(0.4 * 0.3),])
+
+        np.testing.assert_allclose(reference, expected, atol=_ATOL, rtol=_ATOL,)
+
+        # Compare normalization across every available backend.
         logs = np.array([math.log(0.25), float("-inf"), math.log(0.75)])
         mask = np.array([True, True, True])
-        n0, n1 = (B().normalize_log_probs(logs, mask=mask) for B in _BACKENDS)
-        self.assertTrue(np.allclose(n0, n1, atol=_ATOL))
-        self.assertAlmostEqual(float(np.exp(n0).sum()), 1.0, places=12)
+
+        normalize_results = [
+            (B.__name__, B().normalize_log_probs(logs, mask=mask))
+            for B in _BACKENDS
+        ]
+
+        reference_name, normalized = normalize_results[0]
+
+        for backend_name, result in normalize_results[1:]:
+            np.testing.assert_allclose(result, normalized, atol=_ATOL, rtol=_ATOL,
+                err_msg=( f"normalize_log_probs differs between "
+                    f"{reference_name} and {backend_name}"),)
+
+        # The normalized log probabilities must represent total mass 1.
+        self.assertAlmostEqual(float(np.exp(normalized).sum()), 1.0, places=12,)
 
     def test_random_graphs_solver_parity(self):
         rng = np.random.default_rng(11)
@@ -366,15 +394,71 @@ class TestNumpyDenseParity(unittest.TestCase):
 
     def test_tight_tolerance_parity(self):
         rng = np.random.default_rng(3)
-        problem = next(p for p in (_try_random(rng) for _ in range(20)) if p)
-        tight = build_sb_problem(
-            problem.graph, problem.pi0, problem.piT,
-            sb_config=SBConfig(horizon_t=problem.sb_config.horizon_t,
-                               max_iterations=1, tolerance=1e-15),
+
+        problem = next(
+            p
+            for p in (_try_random(rng) for _ in range(20))
+            if p is not None
         )
-        n, d = (solve_sb(tight, backend=B()) for B in _BACKENDS)
-        self.assertEqual(n.trace.converged, d.trace.converged)
-        self.assertEqual(n.trace.iterations, 1)
+
+        tight = build_sb_problem(problem.graph, problem.pi0, problem.piT,
+            sb_config=SBConfig(horizon_t=problem.sb_config.horizon_t, max_iterations=1, tolerance=1e-15,))
+
+        solutions = [
+            (B.__name__, solve_sb(tight, backend=B()))
+            for B in _BACKENDS
+        ]
+
+        reference_name, reference = solutions[0]
+
+        self.assertEqual(reference.trace.iterations, 1)
+
+        for backend_name, solution in solutions[1:]:
+            self.assertEqual(solution.trace.converged, reference.trace.converged,
+                f"Convergence differs between {reference_name} "
+                f"and {backend_name}",)
+
+            self.assertEqual(solution.trace.iterations, reference.trace.iterations,
+                f"Iteration count differs between {reference_name} "
+                f"and {backend_name}",)
+
+            for name, reference_layers, actual_layers in (
+                (
+                    "forward potentials",
+                    reference.log_forward_potentials,
+                    solution.log_forward_potentials,
+                ),
+                (
+                    "backward potentials",
+                    reference.log_backward_potentials,
+                    solution.log_backward_potentials,
+                ),
+                (
+                    "node marginals",
+                    reference.marginals.node_marginals_by_layer,
+                    solution.marginals.node_marginals_by_layer,
+                ),
+                (
+                    "edge marginals",
+                    reference.marginals.edge_marginals_by_time,
+                    solution.marginals.edge_marginals_by_time,
+                ),
+            ):
+                self.assertEqual(
+                    len(reference_layers),
+                    len(actual_layers),
+                    f"{name}: number of layers differs for {backend_name}",
+                )
+
+                for layer_index, (expected, actual) in enumerate(
+                    zip(reference_layers, actual_layers)
+                ):
+                    np.testing.assert_allclose(actual, expected, atol=1e-7, rtol=1e-7,
+                        err_msg=(
+                            f"{name} differ at layer {layer_index} "
+                            f"between {reference_name} and {backend_name}"
+                        ),
+                    )
 
     def test_feasible_random_graphs_full_parity(self):
         rng = np.random.default_rng(73)
